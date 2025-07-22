@@ -1,0 +1,28 @@
+# Personal Use License v1.0
+
+Copyright (c) 2025 Steven Kellum.
+All Rights Reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software for personal, non-commercial use, subject to the following conditions:
+
+1. Include a copy of the following attribution header as a note in the README or as a header in the source file
+
+    Attribution Header
+ ----------------------------------------------------------------------------------------------
+| Copyright (c) 2025 Steven C. Kellum Jr.                                                      |
+| Licensed under the Personal Use License v1.0.                                                |
+| See LICENSE.txt for full terms. For commercial use, contact <mailto:sk@perfectatrifecta.com> |
+ ----------------------------------------------------------------------------------------------
+
+2. The above copyright notice and this permission notice shall be included in all
+   copies or substantial portions of the Software.
+
+3. The software may not be used, modified, distributed, or sold for commercial purposes
+   without express written permission from the copyright holder.
+
+4. For commercial licensing inquiries, contact: Steven Kellum: <mailto:sk@perfectatrifecta.com>
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND.
+THE AUTHOR SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM,
+OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
