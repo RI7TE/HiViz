@@ -1,0 +1,886 @@
+
+from __future__ import annotations
+import os
+import re
+import sys
+
+from collections import OrderedDict
+from collections.abc import Iterable
+from pathlib import Path
+from shlex import quote
+from typing import IO, TYPE_CHECKING
+
+
+sys.path.append(str(Path(__file__).absolute().parent))
+if TYPE_CHECKING:
+    import typing
+
+import atexit
+import datetime as dt
+
+##THREADING
+import queue
+import threading
+
+from contextlib import contextmanager, redirect_stdout, suppress
+
+from _glasses import (
+    COLOR_DICT,
+    RESET,
+    Colors,
+    LogLevel,
+    _parse_level,
+    _strip_ansi,
+    bugout,
+    handle_iter,
+    stamp_date,
+    stdout,
+)
+from colorama import (
+    Fore,
+    Style,
+    init as colorama_init,
+)
+from colorama.ansi import AnsiFore
+
+
+# Global logging queue and thread
+colorama_init(autoreset=False, strip=False, convert=False)
+_log_queue = None
+_log_thread = None
+_log_thread_running = False
+#  lock for thread-safe I/O operations
+from threading import RLock
+
+
+_io_lock = RLock()
+
+
+class HiViz:
+    colors = COLOR_DICT
+    _log_thread_running = False
+    _log_queue = queue.Queue()
+    _log_thread = None
+    _log_directory = Path.cwd()
+    _log_file: Path = _log_directory / 'debug.log'
+    _log_filename: str = os.getenv('LOG_FILE', 'debug.log')
+
+    def __init__(
+        self,
+        *,
+        log_filename: str | None = None,
+        to_debug: bool | None = None,
+        to_log: bool | None = None,
+        to_term: bool | None = None,
+        color: str | None = None,
+        log_file: Path | str | None = None,
+        term_level: int | str | None = None,
+        file_level: int | str | None = None,
+        stderr_level: int | str | None = None,
+        default_color: Colors | str | None = None,
+    ):
+        self._level = LogLevel.INFO
+        self._ctx_stack: list[dict[str, typing.Any]] = []
+        ### COLOR SETTINGS ###
+        self._default_color: Colors = (
+            default_color
+            if default_color and isinstance(default_color, Colors)
+            else self.colors.get(str(default_color), Colors.BLUE)
+        )
+        self._color: Colors = self._resolve_color(color or self._default_color.name)
+        self.color_name = self._color.inverse()
+        ### MESSAGE BUFFERS ###
+        self._msg = ''
+        self.logging_msg = ''
+        ### LOGGING SETTINGS ###
+        self.to_debug = to_debug or os.getenv('DEBUG', '0') == '1'
+        self.to_log = to_log or os.getenv('LOG', '0') == '1'
+        self.to_term = to_term if to_term is not None else True
+        if log_file:
+            self.log_file = log_file
+            if self._log_file.is_dir():
+                self._log_file = (
+                    self._log_file / log_filename
+                    if log_filename
+                    else self._log_file / self._log_filename
+                )
+        if not log_file:
+            self._log_file = self._log_directory / self._log_filename
+        ##### LEVELS #####
+        self.term_level: LogLevel = _parse_level(
+            term_level or os.getenv('TERM_LEVEL'), LogLevel.INFO
+        )
+        self.file_level: LogLevel = _parse_level(
+            file_level or os.getenv('FILE_LEVEL'), LogLevel.DEBUG
+        )
+        self.stderr_level: LogLevel = _parse_level(
+            stderr_level or os.getenv('STDERR_LEVEL'), LogLevel.WARNING
+        )
+        ### THREADING SETTINGS ###
+        self._stop_event: threading.Event = threading.Event()
+
+        # settings stack for contexts
+
+        atexit.register(self.stop_logging_thread, join=True)
+
+    def _color_default(self, level: LogLevel) -> Colors:
+        if level >= LogLevel.ERROR:
+            return self.colors.get('red', Colors.RED)
+        if level >= LogLevel.WARNING:
+            return self.colors.get('yellow', Colors.YELLOW)
+        if level >= LogLevel.INFO:
+            return self.colors.get('green', Colors.GREEN)
+        return self.colors.get('cyan', Colors.CYAN)
+
+    @property
+    def log_filename(self) -> str:
+        """Return the log file path."""
+        return self._log_file.name
+
+    @log_filename.setter
+    def log_filename(self, value: str):
+        """Set the log file path."""
+        _log_filename = value
+        if not (self._log_directory / _log_filename).exists():
+            (self._log_directory / _log_filename).touch()
+            self._log_file = self._log_directory / _log_filename
+        else:
+            self._log_file = Path(_log_filename).absolute()
+        self._log_directory = self._log_file.parent
+
+    @property
+    def log_file(self) -> Path:
+        """Return the log file path."""
+        return self._log_file
+
+    @log_file.setter
+    def log_file(self, value: Path | str):
+        """Set the log file path."""
+        if isinstance(value, str):
+            value = Path(value)
+        if not value.exists():
+            value.touch()
+        if not value.is_file():
+            raise ValueError(f"Log file must be a file, not a directory: {value}")
+        self._log_file = value.absolute()
+        self._log_directory = self._log_file.parent
+
+    @property
+    def log_queue(self) -> queue.Queue[typing.Any]:
+        return self._log_queue
+
+    @log_queue.setter
+    def log_queue(self, value: queue.Queue[typing.Any]):
+        # global _log_queue
+        self._log_queue = value
+
+    @property
+    def log_thread(self) -> threading.Thread | None:
+        return self._log_thread
+
+    @log_thread.setter
+    def log_thread(self, value: threading.Thread | None):
+        # global _log_thread
+        self._log_thread = value
+
+    @property
+    def log_thread_running(self) -> bool:
+        return self._log_thread_running
+
+    @log_thread_running.setter
+    def log_thread_running(self, value: bool):
+        # global _log_thread_running
+        self._log_thread_running = value
+
+    def _logging_worker(self):
+        """Worker thread that processes log messages from the queue."""
+
+        while self.log_thread_running and not self._stop_event.is_set():
+            try:
+                # Get message with timeout to allow checking _log_thread_running
+                msg_data = self.get(timeout=0.5)
+                if msg_data is None:  # Sentinel to exit
+                    break
+
+                # Unpack the message data
+                (
+                    msg,  # str without color/reset
+                    level,  # LogLevel
+                    color,  # str color code
+                    log_file,  # Path
+                    log_filename,  # str
+                    to_log,  # bool
+                    to_debug,  # bool
+                    to_term,  # bool
+                    term_level,  # LogLevel
+                    file_level,  # LogLevel
+                    stderr_level,  # LogLevel
+                ) = msg_data
+
+                # Execute the actual logging logic (your existing viz code without threading)
+                self._viz_impl(
+                    msg,
+                    level=level,
+                    color=color,
+                    log_file=log_file,
+                    log_filename=log_filename,
+                    to_log=to_log,
+                    to_debug=to_debug,
+                    to_term=to_term,
+                    term_level=term_level,
+                    file_level=file_level,
+                    stderr_level=stderr_level,
+                )
+
+                self.log_queue.task_done()
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Error in logging thread: {e}\n", file=sys.stderr)
+                # Force stderr output during initialization to debug
+                if self.to_debug:
+                    self.bugout(f"ERROR in HiViz init: {e!r}")
+
+                raise
+            else:
+                if to_debug:
+                    self.bugout(
+                        f"HiViz initialized: debugging={self.to_debug}, logging={self.to_log}, terminal={self.to_term}"
+                    )
+
+    def start_logging_thread(self):
+        """Start the logging thread if it's not already running."""
+        if self.to_debug:
+            self.bugout("Starting logging thread\n")
+        if self.log_thread and self.log_thread.is_alive():
+            if self.to_debug:
+                self.bugout("Logging thread is already running")
+            return
+        self._stop_event.clear()
+        self.log_thread = threading.Thread(
+            target=self._logging_worker, name="HiVizWorker", daemon=False
+        )
+        self.log_thread.start()
+        self.log_thread_running = True
+
+    def stop_logging_thread(self, join: bool = True, timeout: float | None = 1.5):
+        """Stop the logging thread gracefully."""
+        if not self.log_thread:
+            return
+        self._stop_event.set()
+        with suppress(Exception):
+            self.log_queue.put_nowait(None)  # Send sentinel to exit
+        self.log_thread_running = False
+
+        if join and threading.current_thread() is not self.log_thread:
+            self.log_thread.join(timeout=timeout or 2.0)
+        self.log_thread = None
+        if self.to_debug:
+            self.bugout("Logging thread stopped")
+
+    def viz_direct(self, *msg, color=None):
+        """Direct implementation without threading for debugging"""
+        self.msg = msg
+        self.color = color
+
+        if self.to_term:
+            stdout(self.msg)
+        return self.msg
+
+    def _resolve_color(self, color: str | Colors) -> Colors:
+        _color = None
+        if isinstance(color, Colors):
+            # AnsiFore constants are strings internally
+            _color = color
+        if isinstance(color, str):
+            color = color.strip().casefold()
+            if not color:
+                _color = self._default_color
+        if (
+            str(color).strip().casefold() not in self.colors
+            and color not in self.colors.values()
+        ):
+            raise ValueError(
+                f"Invalid color: {color}. Must be one of {self.colors.keys()}"
+            )
+        if not _color:
+            _color = self.colors.get(color, self._default_color)
+        self.color_name = _color.name
+        return _color
+
+    @property
+    def log_directory(self) -> Path:
+        """Return the current working directory."""
+        return self._log_directory
+
+    @property
+    def msg(self) -> str:
+        return self._msg
+
+    @msg.setter
+    def msg(self, msg):
+        if isinstance(msg, str):
+            msg = [msg + "\n"]
+        msg = handle_iter(msg)
+        self._msg = f"{self.color}{msg}{RESET}\n"
+
+    @property
+    def log_msg(self) -> str:
+        """Return the log message with timestamp and color."""
+        return "\t\t\t" + stamp_date() + "\n" + _strip_ansi(self._msg) + "\n"
+
+    def viz(
+        self,
+        *msg,
+        level: int | str | LogLevel = LogLevel.INFO,
+        color: str | None = None,
+        log_file: str | Path | None = None,
+        log_filename: str | None = None,
+        to_log: bool | None = None,
+        to_debug: bool | None = None,
+        to_term: bool | None = None,
+        term_level: int | str | None = None,
+        file_level: int | str | None = None,
+        stderr_level: int | str | None = None,
+        default_color: Colors | str | None = None,
+    ) -> str:
+        """Queue logging message to be processed by the logging thread."""
+        # Make sure logging thread is running
+        self.start_logging_thread()
+        # Queue the logging operation
+        self.msg = msg
+        self.level = _parse_level(level, self.level)
+        self.set_options(
+                to_debug=to_debug,
+                to_log=to_log,
+                to_term=to_term,
+                color=color,
+                log_file=log_file,
+                log_filename=log_filename,
+                term_level=term_level,
+                file_level=file_level,
+                stderr_level=stderr_level,
+                default_color=default_color,
+                replacing= False,  # This call will be appended to the context stack
+            )
+        self.put(
+            self.msg,
+            self.level,
+            self.color,
+            self.log_file,
+            self.log_filename,
+            self.to_log,
+            self.to_debug,
+            self.to_term,
+            self.term_level,
+            self.file_level,
+            self.stderr_level,
+        )
+        return str(self.msg).strip()
+
+    def put(self, *args):
+        (
+            msg,
+            level,
+            color,
+            log_file,
+            log_filename,
+            to_log,
+            to_debug,
+            to_term,
+            term_level,
+            file_level,
+            stderr_level,
+        ) = args
+
+        self.log_queue.put(
+            (
+                msg,
+                level,
+                color,
+                log_file,
+                log_filename,
+                to_log,
+                to_debug,
+                to_term,
+                term_level,
+                file_level,
+                stderr_level,
+            )
+        )
+        if self.to_debug:
+            self.bugout(f"HiViz: Message queued at level {level.name}")
+            stdout(f'Is the HiViz log queue empty?: {bool(hiviz)}\n', debug=True)
+
+    def get(self, **kwds):
+        return self.log_queue.get(**kwds)
+
+    def _vout(self, msg, print_color: bool | None = None, stream: IO[str] = sys.stdout):
+        print_color = print_color if print_color is not None else True
+        if msg.strip() != self.msg.strip():
+            self.msg = msg.strip()
+
+        if print_color:
+            stream.write(msg)
+        else:
+            stream.write(_strip_ansi(msg))
+        sys.stdout.flush()
+        if not self.to_term:
+            stdout(
+                f"{Colors.YELLOW.color()}Warning: Not printing to stdout{RESET}",
+                debug=True,
+            )
+        if self.to_debug:
+            self.bugout(
+                f"HiViz: Message output to {'stderr' if stream == sys.stderr else 'stdout'}"
+            )
+
+    def vout(
+        self,
+        *msg,
+        color: str | Colors | None = None,
+        stream: IO[str] = sys.stdout,
+        print_color: bool | None = True,
+    ) -> None:
+        self.color = color
+        self.msg = msg
+        if stream == sys.stdout:
+            self.to_term = True
+        self._vout(msg=self.msg, print_color=print_color, stream=stream)
+
+    def __iter__(self):
+        if self.to_debug:
+            self.bugout("Iterating over HiViz instance")
+        return self
+
+    def _viz_impl(
+        self,
+        msg: str,
+        level: LogLevel,
+        color: Colors | str,
+        log_file: Path,
+        log_filename: str,
+        to_log: bool,
+        to_debug: bool,
+        to_term: bool,
+        term_level: LogLevel,
+        file_level: LogLevel,
+        stderr_level: LogLevel,
+    ) -> str:
+        """
+        Print a message in the specified color.
+        """
+        self.color = color or self._color_default(level)
+        with (
+            _io_lock,
+            self._log(
+                self.log_msg,
+                log_file=log_file,
+                log_filename=log_filename,
+                level=level,
+                to_log=to_log,
+                to_debug=to_debug,
+                to_term=to_term,
+                term_level=term_level,
+                file_level=file_level,
+                stderr_level=stderr_level,
+            ) as stream,
+        ):
+            # Terminal output if enabled and level passes threshold
+            if (stream and to_term and level >= term_level) or (
+                stream and to_debug and level >= stderr_level
+            ):
+                self.vout(msg, color=self.color, stream=stream)
+                if to_debug:
+                    self.bugout(
+                        f"{self.default_color}HiViz: Message processed at level: {level.name}{RESET}"
+                    )
+        if to_debug:
+            self.bugout(
+                f"HiViz: Message processed at level {level.name}{RESET}", level=level
+            )
+        return msg.strip()
+
+    def colorize(self, s: str) -> str:
+        """Return the current color or set a new one."""
+        return f"{self.default_color}{s}{RESET}\n"
+
+    def dbug_msg(self, msg: str, level: LogLevel) -> str:
+        """Return a debug message with the current color."""
+        return f"{stamp_date()} 'HiViz debugger. Loglevel={level.name}\n{self.colorize(msg)}"
+
+    def bugout(self, *debug_msg, level: LogLevel = LogLevel.DEBUG) -> None:
+        """Return a debug message with the current color."""
+        bugout(self.dbug_msg(handle_iter(debug_msg), level))
+
+    @property
+    def color(self) -> str:
+        """Return the current color."""
+        return self._color.code()
+
+    @color.setter
+    def color(self, value: str | Colors | None):
+        """Set the color."""
+        if value is None:
+            self._color = self._color_default(self._level)
+        if isinstance(value, str):
+            self._color = self._resolve_color(value)
+        elif isinstance(value, Colors):
+            self._color = value
+
+    @property
+    def default_color(self) -> str:
+        """Return the default color."""
+        return self._default_color.code()
+
+    @default_color.setter
+    def default_color(self, value: Colors | str | None):
+        """Set the default color."""
+        if value is None:
+            self._default_color = self._color_default(self._level)
+        elif isinstance(value, str):
+            self._default_color = self._resolve_color(value)
+        elif isinstance(value, Colors):
+            self._default_color = value
+
+    @property
+    def level(self) -> LogLevel:
+        """Return the current log level."""
+        return self._level
+
+    @level.setter
+    def level(self, value: int | str | LogLevel):
+        """Set the current log level."""
+        if isinstance(value, LogLevel):
+            self._level = value
+        elif isinstance(value, int):
+            self._level = LogLevel(value)
+        elif isinstance(value, str):
+            self._level = _parse_level(value, self._level)
+        else:
+            raise ValueError(
+                f"Invalid log level: {value}. Must be int, str, or LogLevel."
+            )
+
+    @contextmanager
+    def _log(
+        self,
+        log_msg: str,
+        *,
+        log_file: Path,
+        log_filename: str,
+        level: LogLevel,
+        to_debug: bool,
+        to_term: bool,
+        to_log: bool,
+        term_level: LogLevel,
+        file_level: LogLevel,
+        stderr_level: LogLevel,
+    ):
+        self.log_file = Path(log_file) or self.log_file
+        self.log_filename = log_filename or self.log_filename
+        if to_debug:
+            self.bugout(
+                f"Logging message: {log_msg.strip()} in {self.log_filename} at level {level.name}",
+            )
+        if to_log and level >= file_level:
+            if not self.log_file.exists():
+                self.log_file.touch()
+            if to_debug:
+                self.bugout(f"Log file created: {self.log_file}")
+        with Path(self.log_file).absolute().open('a') as stream:
+            if to_log:
+                stream.write(_strip_ansi(log_msg))
+        stream = sys.stderr if level >= stderr_level else sys.stdout
+        yield stream if (to_term and level >= term_level) else None
+
+    @contextmanager
+    def __call__(self, *args, **kwds):
+        if self.to_debug:
+            self.bugout("Entering Context Manager for HiViz Instance")
+        if self.log_thread_running:
+            if self.to_debug:
+                self.bugout("HiViz logging thread is already running")
+        else:
+            if self.to_debug:
+                self.bugout("Starting HiViz logging thread")
+            self.start_logging_thread()
+
+        started_worker = not (self.log_thread and self.log_thread.is_alive())
+        if started_worker:
+            self.start_logging_thread()
+        self.msg = args
+        try:
+            self.set_options(
+                started_worker=started_worker, msg=self.msg, **kwds, replacing=False
+            )
+            #     Apply the current context settings
+            if self.to_debug:
+                self.bugout("HiViz context manager initialized with settings:")
+                for k, v in self._ctx_stack[-1].items():
+                    if isinstance(v, (Path, Colors)):
+                        v = str(v)
+                    if isinstance(v, Iterable) and not isinstance(v, (str, bytes)):
+                        v = list(v)
+                    if k.startswith('_'):
+                        continue
+                    self.bugout(f"{k.title()}: {v!r}")
+
+            yield self
+        finally:
+            if self.to_debug:
+                self.bugout("Exiting HiViz context manager")
+            snap = self._ctx_stack.pop()
+            self.set_options(**snap, replacing=True)
+            self.level = snap["level"]
+            self.msg = snap["msg"]
+            if snap.get("started_worker") and not self._ctx_stack:
+                self.stop_logging_thread(join=True)
+
+    def __enter__(self):
+        if self.to_debug:
+            self.bugout("Entering Context Manager for HiViz")
+        started_worker = not (self.log_thread and self.log_thread.is_alive())
+
+        options = OrderedDict(
+            to_debug=self.to_debug,
+            to_log=self.to_log,
+            to_term=self.to_term,
+            color=self.color,
+            log_file=self.log_file,
+            log_filename=self.log_filename,
+            term_level=self.term_level,
+            file_level=self.file_level,
+            stderr_level=self.stderr_level,
+            color_name=self.color_name,
+            default_color=self.default_color,
+            level=self.level,
+            msg=self.msg,
+            started_worker=started_worker,  # NEW
+        )
+        self.set_options(**options)
+        if started_worker:
+            self.start_logging_thread()
+        return self
+
+    def __exit__(self, tb_type, tb_val, tb_exc):
+        started_worker = False
+        if tb_type:
+            self._color = self._resolve_color("red")
+            self.bugout(f"Error in HiViz ContextManager:\n{tb_val}\n")
+            return False
+        if self.to_debug:
+            self.color = self._resolve_color("green")
+            self.bugout("Exiting Context-Manager for HiViz")
+        snap = self._ctx_stack.pop()
+        self.set_options(**snap, replacing=True)
+        self.level = snap["level"]
+        self.msg = snap["msg"]
+        if snap.get("started_worker") and not self._ctx_stack:
+            self.stop_logging_thread(join=True)
+        return True
+
+    def __repr__(self):
+        return (
+            f"HiViz(to_debug={self.to_debug}, to_log={self.to_log}, to_term={self.to_term}, "
+            f"term_level={self.term_level.name}, file_level={self.file_level.name}, "
+            f"stderr_level={self.stderr_level.name}, color={self.color_name}, "
+            f"log_file='{self.log_file}', log_filename='{self.log_filename}', "
+            f"default_color={self.default_color}, level={self.level.name})"
+        )
+
+    def __str__(self):
+        return self.__repr__()
+
+    def __bool__(self):
+        return bool(self.log_queue.unfinished_tasks)
+
+    def __len__(self):
+        return self.log_queue.qsize()
+
+    def set_options(
+        self,
+        to_debug: bool | None = None,
+        to_log: bool | None = None,
+        to_term: bool | None = None,
+        color: str | Colors | None = None,
+        log_file: Path | str | None = None,
+        log_filename: str | None = None,
+        term_level: int | str | LogLevel | None = LogLevel.INFO,
+        file_level: int | str | LogLevel | None = LogLevel.DEBUG,
+        stderr_level: int | str | LogLevel | None = LogLevel.WARNING,
+        default_color: Colors | str | None = None,
+        started_worker: bool | None = None,
+        **kwds,
+    ):
+        """Set options for the HiViz instance."""
+        replacing = kwds.pop('replacing', False)
+        if not replacing:
+            self._ctx_stack.append(
+                dict(
+                    to_debug=self.to_debug,
+                    to_log=self.to_log,
+                    to_term=self.to_term,
+                    term_level=self.term_level,
+                    file_level=self.file_level,
+                    stderr_level=self.stderr_level,
+                    color_name=self.color_name,
+                    color=self.color,
+                    log_file=self.log_file,
+                    log_filename=self.log_filename,
+                    default_color=self.default_color,
+                    level=self.level,
+                    msg=self.msg,
+                    started_worker=bool(started_worker),
+                )
+            )
+        if to_debug is not None:
+            self.to_debug = bool(to_debug)
+        if to_log is not None:
+            self.to_log = bool(to_log)
+        if to_term is not None:
+            self.to_term = bool(to_term)
+        if color is not None:
+            self.color = self._resolve_color(color)
+        if log_file is not None:
+            self.log_file = Path(log_file)
+        if log_filename is not None:
+            self.log_filename = log_filename
+        if term_level is not None:
+            self.term_level = _parse_level(term_level, self.term_level)
+        if file_level is not None:
+            self.file_level = _parse_level(file_level, self.file_level)
+        if stderr_level is not None:
+            self.stderr_level = _parse_level(stderr_level, self.stderr_level)
+        if default_color is not None:
+            self.default_color = self._resolve_color(default_color)
+
+        for key, value in kwds.items():
+            if hasattr(self, key):
+                setattr(self, key, value.strip() if isinstance(value, str) else value)
+        return self
+
+
+hiviz = HiViz()
+
+
+def visualize(*msg, **kwds):
+    """This is a debugging function that prints messages to stdout and logs them.
+    kwds can include:
+    - color: str, the color to print the message in
+    - to_log: bool, whether to log the message to a file()
+    - to_debug: bool, whether to print the message to stderr
+    - to_term: bool, whether to print the message to stdout
+    - log_file: Path or str, the file to log the message to
+    - log_filename: str, the name of the log file
+    """
+    with hiviz(*msg, **kwds) as viz:
+        # viz(*msg, **kwds)
+        for k, v in viz.__dict__.items():
+            if isinstance(v, (Path, Colors)):
+                v = str(v)
+            if isinstance(v, Iterable) and not isinstance(v, (str, bytes)):
+                v = list(v)
+            if k.startswith('_'):
+                continue
+            viz.bugout(f"{k.title()}: {v!r}")
+        # v.bugout(f"Logfile: {v.log_file!r}")
+        # v.bugout(f"Level: {v.level.name}")
+        # v.bugout(f"Color: {v.color_name}")
+        # v.bugout(f"Color-Code: {v.color!r}")
+        # v.bugout(f"Terminal: {v.to_term}")
+        # v.bugout(f"Logging: {v.to_log}")
+        # v.bugout(f"Debugging: {v.to_debug}")
+
+
+def viz(*msg, **kwds):
+    """Print a message with optional logging and color.
+    This function is a wrapper around HiViz.viz() that allows for easy logging and printing
+    of messages with color and logging options.
+        kwds can include:
+        - color: str, the color to print the message in
+        - to_log: bool, whether to log the message to a file()
+        - to_debug: bool, whether to print the message to stderr
+        - to_term: bool, whether to print the message to stdout
+        - log_file: Path or str, the file to log the message to
+        - log_filename: str, the name of the log file
+    """
+    atexit.register(lambda: hiviz.stop_logging_thread(join=True))
+    with hiviz(*msg, **kwds):
+        # Call the viz method of the HiViz instance
+        hiviz.viz(*msg, **kwds)
+        # Print the message to stdout if to_term is True
+        if hiviz.to_term:
+            hiviz.vout(*msg, color=hiviz.color, print_color=True)
+        # If to_debug is True, print the message to stderr
+        if hiviz.to_debug:
+            hiviz.bugout(*msg, level=hiviz.level)
+
+
+def test():
+    bugout("Starting test")
+    viz(
+        "This is a test message",
+        color="green",
+        to_log=True,
+        to_debug=True,
+        to_term=True,
+        log_file='test.log',
+    )
+    visualize(
+        "logged but NOT IN TERMINAL message",
+        color="red",
+        to_log=True,
+        to_term=False,
+        log_filename="no-terminal-msg.log",
+    )
+
+
+# viz(
+#     "This message won't be logged",
+#     to_log=False,
+#     to_term=False,
+#     log_filename="no-msg-logged.log",
+# )
+# visualize(
+#     "This message will not be printed to stdout",
+#     to_term=False,
+#     log_file=Path("not-stdout-msg.log"),
+# )
+# viz(
+#     "This message will be printed to stdout",
+#     to_term=True,
+#     log_file=Path("print-to-stdout.log"),
+# )
+# viz(
+#     "This message will be logged to a file",
+#     to_log=True,
+#     log_file='test_output.log',
+#     to_term=False,
+# )
+# viz("This message will be printed in red", color='red')
+# viz("green text", color="green")
+
+
+if __name__ == "__main__":
+    test()
+    # viz("This will be printed stdout")
+    # stdout("HELLO")
+    # viz("raw ansi magenta", color="\033[35m")
+    # viz("default blue")
+    # viz("red then reset", color="red")
+    # viz("debug to stdout", level="DEBUG", to_term=True, to_log=False, color="cyan")
+    # viz("info to stdout and file", level="INFO", to_log=True)
+    # viz("warning to stderr", level="WARNING")
+    # viz("error to stderr and file", level="ERROR", to_log=True)
+    # print([i for i in hiviz])
+    with HiViz() as h:
+        h.viz("Inside context manager - info", level="INFO", to_log=True)
+        h.viz("Inside context manager - warning", level="WARNING", to_log=True)
+        h.viz("Inside context manager - error", level="ERROR", to_log=True)
+        h.bugout("This is a bugout message inside the context manager")
+        with HiViz(to_debug=True, color="magenta") as h2:
+            h2.viz("Nested context manager - debug", level="DEBUG", to_log=True)
+            h2.bugout("This is a bugout message inside the nested context manager")
+        h.viz("Back to outer context manager - info", level="INFO", to_log=True)
