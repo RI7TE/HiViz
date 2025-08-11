@@ -1,6 +1,8 @@
+import platform
+
 from setuptools import setup
 
-import platform
+
 setup(
     name='HiViz',
     version='0.1.0',
@@ -10,8 +12,7 @@ setup(
     download_url='https://github.com/RI7TE/HiViz.git',
     license="'Proprietary License'",
     packages=[],
-    py_modules=['hiviz'],
+    py_modules=['hiviz', '_glasses'],
     python_requires=f">={platform.python_version_tuple()[0]}.{platform.python_version_tuple()[1]}",
     install_requires=['colorama==0.4.6'],
-
 )
