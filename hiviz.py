@@ -4,6 +4,7 @@ import atexit
 import json
 import os
 import queue
+import sys
 import threading
 import time
 
@@ -68,6 +69,7 @@ class _Rotation:
         except Exception as e:
             bugout(f"Rotation error: {e!r}")
 
+
 '''log_file: st
 to_debug: bo
 to_log: bool
@@ -80,16 +82,22 @@ color: Color
 json_logs: b
 max_bytes: i
 backup_count'''
+
+
 class HiViz:
     __slots__ = (
         '_color',
+        '_color_name',
         '_ctx_stack',
         '_default_color',
         '_file_level',
         '_io_lock',
         '_json_logs',
         '_level',
-        '_log_path',
+        '_log_directory',
+        '_log_file',
+        '_log_filename',
+        '_logging_msg',
         '_msg',
         '_q',
         '_rotation',
@@ -102,6 +110,7 @@ class HiViz:
         '_worker',
     )
     colors = COLOR_DICT
+
     def __init__(
         self,
         *,
@@ -117,43 +126,57 @@ class HiViz:
         json_logs: bool = False,
         max_bytes: int = 2_000_000,
         backup_count: int = 3,
+        log_filename: str = "hiviz.log",
     ):
         self._level = LogLevel.INFO
-        self._color = self._resolve_color(
-            (color if isinstance(color, str) else getattr(color, "name", None))
-            or (
-                default_color
-                if isinstance(default_color, str)
-                else getattr(default_color, "name", None)
-            )
-            or "blue"
+        self._default_color: Colors = (
+            default_color
+            if default_color and isinstance(default_color, Colors)
+            else self.colors.get(str(default_color), Colors.BLUE)
         )
-        self._default_color = self._color
-        self._msg = ""
+        self._color: Colors = self._resolve_color(color or self._default_color.name)
+        self._color_name = self._color.inverse()
+        ### MESSAGE BUFFERS ###
+        self._msg = ''
+        self._logging_msg = ''
+        ### LOGGING SETTINGS ###
+        self._to_debug = to_debug or os.getenv('DEBUG', '0') == '1'
+        self._to_log = to_log or os.getenv('LOG', '0') == '1'
+        self._to_term = to_term if to_term is not None else True
+        if log_file:
+            self._log_file = log_file
+            if self._log_file.is_dir():
+                self._log_file = (
+                    self._log_file / log_filename
+                    if log_filename
+                    else self._log_file / self._log_filename
+                )
+        self._log_directory = (
+            Path(log_file).parent if isinstance(log_file, str) else Path.cwd()
+        )
+        if not log_file:
+            self._log_file = self._log_directory / log_filename
+        else:
+            self._log_file = Path(log_file)
+            log_filename = log_file.name
+        if not self._log_file.is_absolute():
+            self._log_file = Path.cwd() / self._log_file
+        if not self._log_file.parent.exists():
+            self._log_file.parent.mkdir(parents=True, exist_ok=True)
+        self._log_filename = log_filename
+        ##### LEVELS #####
+        self._term_level: LogLevel = _parse_level(
+            term_level or os.getenv('TERM_LEVEL'), LogLevel.INFO
+        )
+        self._file_level: LogLevel = _parse_level(
+            file_level or os.getenv('FILE_LEVEL'), LogLevel.DEBUG
+        )
+        self._stderr_level: LogLevel = _parse_level(
+            stderr_level or os.getenv('STDERR_LEVEL'), LogLevel.WARNING
+        )
 
-        self._to_debug = bool(to_debug or os.getenv("DEBUG", "0") == "1")
-        self._to_log = bool(to_log or os.getenv("LOG", "0") == "1")
-        self._to_term = True if to_term is None else bool(to_term)
-
-        self._term_level = _parse_level(
-            term_level or os.getenv("TERM_LEVEL"), LogLevel.INFO
-        )
-        self._file_level = _parse_level(
-            file_level or os.getenv("FILE_LEVEL"), LogLevel.DEBUG
-        )
-        self._stderr_level = _parse_level(
-            stderr_level or os.getenv("STDERR_LEVEL"), LogLevel.WARNING
-        )
-
-        self._log_path = (
-            Path(log_file)
-            if log_file
-            else Path.cwd() / (os.getenv("LOG_FILE", "debug.log"))
-        )
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._log_path.touch(exist_ok=True)
         self._rotation = _Rotation(
-            self._log_path, max_bytes=max_bytes, backup_count=backup_count
+            self._log_file, max_bytes=max_bytes, backup_count=backup_count
         )
 
         self._json_logs = json_logs
@@ -184,6 +207,10 @@ class HiViz:
     def color(self) -> str:
         return self._color.code()
 
+    @property
+    def color_name(self) -> str:
+        return self._color_name
+
     @color.setter
     def color(self, value: Colors | str | None):
         if value is None:
@@ -205,6 +232,22 @@ class HiViz:
             self._default_color = value
         else:
             self._default_color = self._resolve_color(value)
+
+    @property
+    def msg(self) -> str:
+        return self._msg
+
+    @msg.setter
+    def msg(self, msg):
+        if isinstance(msg, str):
+            msg = [msg + "\n"]
+        msg = handle_iter(msg)
+        self._msg = f"{self.color}{msg}{RESET}\n"
+        self._logging_msg = _strip_ansi(self._msg)
+
+    @property
+    def logging_msg(self) -> str:
+        return self._logging_msg
 
     @property
     def to_term(self) -> bool:
@@ -232,7 +275,19 @@ class HiViz:
 
     @property
     def log_file(self) -> Path:
-        return self._log_path
+        return self._log_file
+
+    @log_file.setter
+    def log_file(self, value: str | Path):
+        if isinstance(value, str):
+            value = Path(value)
+        if not value.is_absolute():
+            value = Path.cwd() / value
+        self._log_file = value
+        if not self._log_file.parent.exists():
+            self._log_file.parent.mkdir(parents=True, exist_ok=True)
+        if not self._log_file.exists():
+            self._log_file.touch(exist_ok=True)
 
     # ---------- core ----------
     def start(self) -> None:
@@ -265,12 +320,13 @@ class HiViz:
         while not self._stop.is_set():
             try:
                 msg, lvl, color, ctx, src, lineno = self._q.get(timeout=0.25)
+                self.msg = msg  # update msg for vout
             except queue.Empty:
                 continue
-            if msg == "__SENTINEL__":
+            if self.msg == "__SENTINEL__":
                 break
             try:
-                self._emit(msg, lvl, color, ctx, src, lineno)
+                self._emit(self.msg, lvl, color, ctx, src, lineno)
             except Exception as e:
                 bugout(f"Emit error: {e!r}")
             finally:
@@ -291,6 +347,7 @@ class HiViz:
             if isinstance(color, Colors)
             else self._resolve_color(color).code()
         )
+        self.color = color_code
         plain = _strip_ansi(msg)
         rec = LogRecord(
             ts=ts,
@@ -313,29 +370,42 @@ class HiViz:
             # file
             if self._to_log and level >= self._file_level:
                 self._rotation.maybe_rotate()
-                with self._log_path.open("a", encoding="utf-8", newline="") as f:
+                with self.log_file.open("a", encoding="utf-8", newline="") as f:
                     f.write(out_line)
             # terminal/stdout or stderr
             if self._to_term and level >= self._term_level:
-                stream: IO[str] = (  # stderr for >= threshold
-                    (__import__("sys").stderr)
-                    if level >= self._stderr_level
-                    else (__import__("sys").stdout)
+                stream: IO[str] = (
+                    sys.stderr if level >= self._stderr_level else sys.stdout
                 )
-                stream.write(f"{color_code}{msg}{RESET}\n")
-                stream.flush()
+
+                self.vout(
+                    f"{self.msg}", color=color_code, stream=stream, print_color=True
+                )
             # debug stream (forced to stderr)
             if self._to_debug and level >= LogLevel.DEBUG:
                 bugout(f"{level.name}: {plain}")
 
     # ---------- convenience ----------
     def _resolve_color(self, color: str | Colors) -> Colors:
+        _color = None
         if isinstance(color, Colors):
-            return color
-        name = str(color).strip().lower()
-        if name in self.colors:
-            return self.colors[name]
-        raise ValueError(f"Invalid color: {color}. Options: {list(self.colors.keys())}")
+            # AnsiFore constants are strings internally
+            _color = color
+        if isinstance(color, str):
+            color = color.strip().casefold()
+            if not color:
+                _color = self._default_color
+        if (
+            str(color).strip().casefold() not in self.colors
+            and color not in self.colors.values()
+        ):
+            raise ValueError(
+                f"Invalid color: {color}. Must be one of {self.colors.keys()}"
+            )
+        if not _color:
+            _color = self.colors.get(color, self._default_color)
+        self._color_name = _color.name
+        return _color
 
     def _color_default(self, level: LogLevel) -> Colors:
         if level >= LogLevel.ERROR:
@@ -394,19 +464,52 @@ class HiViz:
         self._q.put((text, lvl, c, ctx, src, lineno))
 
     def debug(self, *msg: Any, **ctx: Any) -> None:
-        self.log(LogLevel.DEBUG, *msg, **ctx)
+        self.log(*msg, level=LogLevel.DEBUG, **ctx)
 
     def info(self, *msg: Any, **ctx: Any) -> None:
-        self.log(LogLevel.INFO, *msg, **ctx)
+        self.log(*msg, level=LogLevel.INFO, **ctx)
 
     def warning(self, *msg: Any, **ctx: Any) -> None:
-        self.log(LogLevel.WARNING, *msg, **ctx)
+        self.log(*msg, level=LogLevel.WARNING, **ctx)
 
     def error(self, *msg: Any, **ctx: Any) -> None:
-        self.log(LogLevel.ERROR, *msg, **ctx)
+        self.log(*msg, level=LogLevel.ERROR, **ctx)
 
     def critical(self, *msg: Any, **ctx: Any) -> None:
-        self.log(LogLevel.CRITICAL, *msg, **ctx)
+        self.log(*msg, level=LogLevel.CRITICAL, **ctx)
+
+    def _vout(self, msg, print_color: bool | None = None, stream: IO[str] = sys.stdout):
+        print_color = print_color if print_color is not None else True
+        if msg != self.msg:
+            self.msg = msg
+
+        if print_color:
+            stream.write(msg)
+        else:
+            stream.write(_strip_ansi(msg))
+        sys.stdout.flush()
+        if not self._to_term:
+            stdout(
+                f"{Colors.YELLOW.color()}Warning: Not printing to stdout{RESET}",
+                debug=True,
+            )
+        if self._to_debug:
+            bugout(
+                f"HiViz: Message output to {'stderr' if stream == sys.stderr else 'stdout'}"
+            )
+
+    def vout(
+        self,
+        *msg,
+        color: str | Colors | None = None,
+        stream: IO[str] = sys.stdout,
+        print_color: bool | None = True,
+    ) -> None:
+        self.color = color
+        self.msg = msg
+        if stream == sys.stdout:
+            self._to_term = True
+        self._vout(msg=self.msg, print_color=print_color, stream=stream)
 
     # ---------- context + configuration ----------
     def set_options(
@@ -432,7 +535,7 @@ class HiViz:
             _term_level=self._term_level,
             _file_level=self._file_level,
             _stderr_level=self._stderr_level,
-            _log_path=self._log_path,
+            _log_file=self.log_file,
             _json_logs=self._json_logs,
         )
         self._ctx_stack.append(snap)
@@ -457,7 +560,7 @@ class HiViz:
             p = Path(log_file)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.touch(exist_ok=True)
-            self._log_path = p
+            self.log_file = p
         if json_logs is not None:
             self._json_logs = bool(json_logs)
 
@@ -473,7 +576,7 @@ class HiViz:
         self._term_level = snap["_term_level"]
         self._file_level = snap["_file_level"]
         self._stderr_level = snap["_stderr_level"]
-        self._log_path = snap["_log_path"]
+        self.log_file = snap["_log_file"]
         self._json_logs = snap["_json_logs"]
 
     @contextmanager
@@ -496,7 +599,7 @@ class HiViz:
                 raise
             finally:
                 dt = (time.perf_counter() - t0) * 1000.0
-                self.log(f"{label}: {dt:.2f} ms",level=level)
+                self.log(f"{label}: {dt:.2f} ms", level=level)
 
         return _ctx()
 
@@ -506,7 +609,9 @@ class HiViz:
                 try:
                     return fn(*a, **kw)
                 except Exception as e:
-                    self.log(f"Exception in {fn.__name__}: {e!r}", level=level, exc_info=True)
+                    self.log(
+                        f"Exception in {fn.__name__}: {e!r}", level=level, exc_info=True
+                    )
                     raise
 
             return inner
@@ -566,4 +671,6 @@ if __name__ == "__main__":
         boom()
     with hiviz.options(to_term=False, json_logs=True):
         viz("logged only to file as JSON", level="DEBUG", color="cyan", tag="json-only")
+    hiviz.vout("This is a colored message", color="blue", stream=sys.stdout)
+    print(hiviz.log_file)
     hiviz.stop()
