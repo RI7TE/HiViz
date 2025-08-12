@@ -68,10 +68,40 @@ class _Rotation:
         except Exception as e:
             bugout(f"Rotation error: {e!r}")
 
-
+'''log_file: st
+to_debug: bo
+to_log: bool
+to_term: boo
+term_level:
+file_level:
+stderr_level
+default_colo
+color: Color
+json_logs: b
+max_bytes: i
+backup_count'''
 class HiViz:
+    __slots__ = (
+        '_color',
+        '_ctx_stack',
+        '_default_color',
+        '_file_level',
+        '_io_lock',
+        '_json_logs',
+        '_level',
+        '_log_path',
+        '_msg',
+        '_q',
+        '_rotation',
+        '_stderr_level',
+        '_stop',
+        '_term_level',
+        '_to_debug',
+        '_to_log',
+        '_to_term',
+        '_worker',
+    )
     colors = COLOR_DICT
-
     def __init__(
         self,
         *,
@@ -316,11 +346,25 @@ class HiViz:
 
     def log(
         self,
-        level: int | str | LogLevel,
         *msg: Any,
+        level: int | str | LogLevel,
         color: Colors | str | None = None,
         **ctx: Any,
     ) -> None:
+        def extract_ctx(
+            msg_kwds: dict[str, Any],
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            context = {}
+            for k, v in msg_kwds.items():
+                if (k in self.__slots__ or f"_{k}" in self.__slots__) and not callable(
+                    v
+                ):
+                    context[k] = msg_kwds.pop(k)
+                else:
+                    continue
+            return context, msg_kwds
+
+        msg_kwds, ctx = extract_ctx(ctx)
         lvl = (
             self._level
             if level is None
@@ -336,6 +380,9 @@ class HiViz:
             else (color if isinstance(color, Colors) else self._resolve_color(color))
         )
         text = handle_iter(msg)
+        if len(msg_kwds):
+            msg_kwds = handle_iter(msg_kwds)
+            text = f"{text}\n{msg_kwds}"
         frame = __import__("inspect").currentframe()
         # step back two frames to caller
         if frame and frame.f_back and frame.f_back.f_back:
@@ -343,6 +390,7 @@ class HiViz:
             src, lineno = str(fi.filename), int(fi.lineno)
         else:
             src, lineno = "unknown", 0
+
         self._q.put((text, lvl, c, ctx, src, lineno))
 
     def debug(self, *msg: Any, **ctx: Any) -> None:
@@ -448,7 +496,7 @@ class HiViz:
                 raise
             finally:
                 dt = (time.perf_counter() - t0) * 1000.0
-                self.log(level, f"{label}: {dt:.2f} ms")
+                self.log(f"{label}: {dt:.2f} ms",level=level)
 
         return _ctx()
 
@@ -458,7 +506,7 @@ class HiViz:
                 try:
                     return fn(*a, **kw)
                 except Exception as e:
-                    self.log(level, f"Exception in {fn.__name__}: {e!r}")
+                    self.log(f"Exception in {fn.__name__}: {e!r}", level=level, exc_info=True)
                     raise
 
             return inner
@@ -492,7 +540,7 @@ def viz(
     color: str | Colors | None = None,
     **ctx: Any,
 ) -> None:
-    hiviz.log(level, *msg, color=color, **ctx)
+    hiviz.log(*msg, level=level, color=color, **ctx)
 
 
 def visualize(*msg: Any, **kw: Any) -> None:

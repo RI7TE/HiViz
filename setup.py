@@ -1,4 +1,4 @@
-import platform
+
 
 from setuptools import setup
 
@@ -13,6 +13,6 @@ setup(
     license="'Proprietary License'",
     packages=[],
     py_modules=['hiviz', '_glasses'],
-    python_requires=f">={platform.python_version_tuple()[0]}.{platform.python_version_tuple()[1]}",
+    python_requires=">=3.11",
     install_requires=['colorama==0.4.6'],
 )
